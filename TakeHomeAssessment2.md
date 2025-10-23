@@ -63,8 +63,9 @@ class SimpleCache<K, V> {
    2. Alternatively, we can also run a periodic scheduler that will go through all entries and remove any expired ones.  
 3. Unless we know how many unique keys are possible for this cache, we will need to set maximum capacity.
    1. Without capacity, we cannot control how much memory every cache will take. Leading to a risk of `OutOfMemoryError`. 
-   2. Here's a rough way to implement capacity and make sure we're not exceeding the capacity using queue
+   2. Here's a rough way to implement capacity and make sure we're not exceeding the capacity using queue.
     ```kotlin
+   // Notice that we're adding the capacity through dependency injection as well
     class SimpleCache<K, V> (val ttlMs: Int, val capacity: Int) {
         private val cache = ConcurrentHashMap<K, CacheEntry<V>>()
         private val queue = ArrayDeque<K>()
@@ -73,6 +74,7 @@ class SimpleCache<K, V> {
     
         fun put(key: K, value: V) {
             cache[key] = CacheEntry(value, System.currentTimeMillis())
+            // New entry is always considered most recently used
             queue.addFirst(key)
             evict()
         }
@@ -95,7 +97,7 @@ class SimpleCache<K, V> {
         fun size(): Int {
             return cache.size
         }
-    
+        
         fun evict() {
             if (size() > capacity) {
                 val leastRecentlyUsed = queue.removeLast()
@@ -104,3 +106,4 @@ class SimpleCache<K, V> {
         }
     }
     ```
+   3. Example above is an LRU cache where least recently used entry are removed when capacity is reached. There's also LFU where we remove least frequently used instead.
