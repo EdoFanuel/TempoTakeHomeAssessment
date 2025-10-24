@@ -31,79 +31,145 @@ class SimpleCache<K, V> {
 ```
 
 # My Feedbacks
-1. TTL should not be hardcoded. Move this to a external configuration and use dependency injection.
-   1. This will make it near impossible to change in production without building & deploying a new code.
-   2. Having it hardcoded will also make it impossible to have different values between environment. For example: 
-      1. Testing environment might want a lower TTL to test the expiration logic faster
-      2. Production environment however might want to use longer TTL to avoid fetching the value from DB too often.
-   3. This is also implemented with generic types. Which indicates this will be used to cache different types of data with different expiry duration
-   4. Here's a quick fix:
-    ```kotlin
-   // Notice the ttlMs is now a dependency injected through the constructor 
-   class SimpleCache<K, V> (val ttlMs: Int) {
-        private val cache = ConcurrentHashMap<K, CacheEntry<V>>()
-        // Rest of the code
+## [Major] Remove Hardcoded TTL
+TTL should not be hardcoded. Move this to a external configuration and use dependency injection.
+1. This will make it near impossible to change in production without building & deploying a new code.
+2. Having it hardcoded will also make it impossible to have different values between environment. For example: 
+   1. Testing environment might want a lower TTL to test the expiration logic faster
+   2. Production environment however might want to use longer TTL to avoid fetching the value from DB too often.
+3. This is also implemented with generic types. Which indicates this will be used for different types of data with different expiry requirement
+4. Here's a quick fix:
+```kotlin
+// Notice the ttlMs is now a dependency injected through the constructor 
+class SimpleCache<K, V> (val ttlMs: Int) {
+    private val cache = ConcurrentHashMap<K, CacheEntry<V>>()
+    // Rest of the code
+}
+```
+## [Fatal] Remove Expired Entry
+Need to remove the entry from the map if it's already expired. 
+Otherwise, it will live in the memory forever. 
+Here's one way to fix it. 
+ ```kotlin
+ fun get(key: K): V? {
+     val entry = cache[key]
+     if (entry != null) {
+         if (System.currentTimeMillis() - entry.timestamp < ttlMs) {
+             return entry.value
+         } else {
+             cache.remove(key) // Add this part to remove the expired entry
+         }
+     }
+     return null
+ }
+ ```
+Alternatively, we can also run a periodic scheduler that will go through all entries and remove any expired ones. 
+Which will cost extra cache reads but might be worth doing if every entry is taking a lot of memory 
+and we want to ensure it's freed as soon as possible.
+
+## [Medium] Set Maximum Cache Capacity
+Unless we know how many unique keys are possible for this cache, 
+we will need to set maximum capacity. 
+Without capacity, we cannot control how much memory every cache will take. 
+Leading to a risk of `OutOfMemoryError`. 
+
+Here's a rough way to implement capacity and make sure we're not exceeding the capacity using queue.
+```kotlin
+// Notice that we're adding the capacity through dependency injection as well
+class SimpleCache<K, V> (val ttlMs: Int, val capacity: Int) {
+    private val cache = ConcurrentHashMap<K, CacheEntry<V>>()
+    private val queue = ArrayDeque<K>()
+
+    data class CacheEntry<V>(val value: V, val timestamp: Long)
+
+    fun put(key: K, value: V) {
+        cache[key] = CacheEntry(value, System.currentTimeMillis())
+        // New entry is always considered most recently used
+        queue.addFirst(key)
+        evict()
     }
-    ```
-2. Need to remove the entry from the map if it's already expired. Otherwise, it will live in the memory forever. 
-   1. Here's one way to fix it. 
-    ```kotlin
+
     fun get(key: K): V? {
         val entry = cache[key]
         if (entry != null) {
+            // Key is accessed. Move it to the most recently used
+            queue.remove(key)
+            queue.addFirst(key)
             if (System.currentTimeMillis() - entry.timestamp < ttlMs) {
                 return entry.value
             } else {
-                cache.remove(key) // Add this part to remove the expired entry
+                cache.remove(key)
+                queue.remove(key)
             }
         }
         return null
     }
-    ```
-   2. Alternatively, we can also run a periodic scheduler that will go through all entries and remove any expired ones.  
-3. Unless we know how many unique keys are possible for this cache, we will need to set maximum capacity.
-   1. Without capacity, we cannot control how much memory every cache will take. Leading to a risk of `OutOfMemoryError`. 
-   2. Here's a rough way to implement capacity and make sure we're not exceeding the capacity using queue.
-    ```kotlin
-   // Notice that we're adding the capacity through dependency injection as well
-    class SimpleCache<K, V> (val ttlMs: Int, val capacity: Int) {
-        private val cache = ConcurrentHashMap<K, CacheEntry<V>>()
-        private val queue = ArrayDeque<K>()
+
+    fun size(): Int {
+        return cache.size
+    }
     
-        data class CacheEntry<V>(val value: V, val timestamp: Long)
-    
-        fun put(key: K, value: V) {
-            cache[key] = CacheEntry(value, System.currentTimeMillis())
-            // New entry is always considered most recently used
-            queue.addFirst(key)
-            evict()
-        }
-    
-        fun get(key: K): V? {
-            val entry = cache[key]
-            if (entry != null) {
-                // Key is accessed. Move it to the most recently used
-                queue.remove(key)
-                queue.addFirst(key)
-                if (System.currentTimeMillis() - entry.timestamp < ttlMs) {
-                    return entry.value
-                } else {
-                    cache.remove(key)
-                }
-            }
-            return null
-        }
-    
-        fun size(): Int {
-            return cache.size
-        }
-        
-        fun evict() {
-            if (size() > capacity) {
-                val leastRecentlyUsed = queue.removeLast()
-                cache.remove(leastRecentlyUsed)
-            }
+    fun evict() {
+        if (size() > capacity) {
+            val leastRecentlyUsed = queue.removeLast()
+            cache.remove(leastRecentlyUsed)
         }
     }
-    ```
-   3. Example above is an LRU cache where least recently used entry are removed when capacity is reached. There's also LFU where we remove least frequently used instead.
+}
+```
+Example above is an LRU cache where least recently used entry are removed when capacity is reached. 
+There's also LFU where we remove least frequently used instead.
+
+## [Medium] Introduce Random Offset
+Having the same TTL for every entry means that any entry created together will expire together.
+This will result in a spike of cache misses, 
+leading to traffic spike to DB or other underlying sources to recreate the expired entries.
+And this will repeat whenever the TTL is reached. 
+
+Adding a random offset, even just something as little as 2 - 5% will spread the expiration time.
+This will flatten out the spike, and eventually will spread the expiration time relatively equal across time.
+
+Here's how I would do it:
+```kotlin
+// Offset is expressed in percentage
+// and expected to have value between 0.0 - 1.0
+class SimpleCache<K, V> (
+    val ttlMs: Int = 60000, // 1 minute
+    val capacity: Int = Int.MAX_VALUE,
+    val offset: Double = 0.0
+) {
+    private val cache = ConcurrentHashMap<K, CacheEntry<V>>()
+    private val queue = ArrayDeque<K>()
+
+    data class CacheEntry<V>(val value: V, val timestamp: Long)
+
+    fun put(key: K, value: V) {
+        val minTtl = ttlMs * (1 - offset) // Shortest TTL allowed
+        val maxTtl = ttlMs * (1 + offset) // Longest TTL allowed
+        val ttl = Random.nextDouble(minTtl, maxTtl).toLong()
+        cache[key] = CacheEntry(value, System.currentTimeMillis() + ttl)
+        queue.addFirst(key)
+        evict()
+    }
+
+    fun get(key: K): V? {
+        val entry = cache[key] ?: return null
+        // Key is accessed. Move it to the most recently used
+        queue.remove(key)
+        queue.addFirst(key)
+        if (entry.timestamp >= System.currentTimeMillis()) return entry.value
+        // Entry has expired
+        cache.remove(key)
+        queue.remove(key)
+        return null
+    }
+
+    fun size(): Int = cache.size
+
+    fun evict() {
+        if (size() <= capacity) return
+        val leastRecentlyUsed = queue.removeLast()
+        cache.remove(leastRecentlyUsed)
+    }
+}
+```
